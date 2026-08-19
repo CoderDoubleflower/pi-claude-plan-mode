@@ -1,17 +1,31 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { THINKING_LEVELS, type LoadedPlanModeConfig, type PhaseProfileConfig, type PlanModeConfig } from "./types.js";
+import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import {
+  THINKING_LEVELS,
+  type LoadedPlanModeConfig,
+  type PhaseProfileConfig,
+  type PlanModeConfig,
+} from "./types.js";
 
-const DEFAULT_CONFIG: PlanModeConfig = {
-  planning: {},
-  execution: {},
-};
+export function createEmptyPlanModeConfig(): PlanModeConfig {
+  return {
+    planning: {},
+    execution: {},
+  };
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function parseProfile(value: unknown, source: string, key: "planning" | "execution", warnings: string[]): PhaseProfileConfig {
+function parseProfile(
+  value: unknown,
+  source: string,
+  key: "planning" | "execution",
+  warnings: string[],
+): PhaseProfileConfig {
   if (value === undefined) return {};
   if (!isRecord(value)) {
     warnings.push(`${source}: "${key}" must be an object.`);
@@ -46,21 +60,45 @@ function parseProfile(value: unknown, source: string, key: "planning" | "executi
   return profile;
 }
 
+function parseTools(value: unknown, source: string, warnings: string[]): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    warnings.push(`${source}: "tools" must be an array of tool names.`);
+    return undefined;
+  }
+
+  const tools: string[] = [];
+  const seen = new Set<string>();
+  value.forEach((item, index) => {
+    if (typeof item !== "string" || !item.trim()) {
+      warnings.push(`${source}: "tools[${index}]" must be a non-empty string.`);
+      return;
+    }
+    const name = item.trim();
+    if (seen.has(name)) return;
+    seen.add(name);
+    tools.push(name);
+  });
+  return tools;
+}
+
 function readConfigFile(filePath: string, warnings: string[]): PlanModeConfig {
-  if (!existsSync(filePath)) return structuredClone(DEFAULT_CONFIG);
+  if (!existsSync(filePath)) return createEmptyPlanModeConfig();
   try {
     const parsed = JSON.parse(readFileSync(filePath, "utf8")) as unknown;
     if (!isRecord(parsed)) {
       warnings.push(`${filePath}: root value must be an object.`);
-      return structuredClone(DEFAULT_CONFIG);
+      return createEmptyPlanModeConfig();
     }
+    const tools = parseTools(parsed.tools, filePath, warnings);
     return {
+      ...(tools !== undefined ? { tools } : {}),
       planning: parseProfile(parsed.planning, filePath, "planning", warnings),
       execution: parseProfile(parsed.execution, filePath, "execution", warnings),
     };
   } catch (error) {
     warnings.push(`${filePath}: unable to read configuration: ${error instanceof Error ? error.message : String(error)}`);
-    return structuredClone(DEFAULT_CONFIG);
+    return createEmptyPlanModeConfig();
   }
 }
 
@@ -69,6 +107,28 @@ function mergeProfile(base: PhaseProfileConfig, override: PhaseProfileConfig): P
     ...base,
     ...override,
   };
+}
+
+function serializableConfig(config: PlanModeConfig): PlanModeConfig {
+  return {
+    ...(config.tools !== undefined ? { tools: [...new Set(config.tools.map((name) => name.trim()).filter(Boolean))] } : {}),
+    planning: { ...config.planning },
+    execution: { ...config.execution },
+  };
+}
+
+export async function savePlanModeConfig(filePath: string, config: PlanModeConfig): Promise<void> {
+  const directory = dirname(filePath);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  const content = `${JSON.stringify(serializableConfig(config), null, 2)}\n`;
+  try {
+    await writeFile(tempPath, content, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    await rename(tempPath, filePath);
+  } catch (error) {
+    await rm(tempPath, { force: true }).catch(() => undefined);
+    throw error;
+  }
 }
 
 export function loadPlanModeConfig(
@@ -82,14 +142,21 @@ export function loadPlanModeConfig(
   const warnings: string[] = [];
   const globalConfig = readConfigFile(globalPath, warnings);
   const projectConfig = options.loadProjectConfig === false
-    ? structuredClone(DEFAULT_CONFIG)
+    ? createEmptyPlanModeConfig()
     : readConfigFile(projectPath, warnings);
 
   return {
     globalPath,
     projectPath,
     warnings,
+    globalConfig,
+    projectConfig,
     config: {
+      ...(projectConfig.tools !== undefined
+        ? { tools: [...projectConfig.tools] }
+        : globalConfig.tools !== undefined
+          ? { tools: [...globalConfig.tools] }
+          : {}),
       planning: mergeProfile(globalConfig.planning, projectConfig.planning),
       execution: mergeProfile(globalConfig.execution, projectConfig.execution),
     },

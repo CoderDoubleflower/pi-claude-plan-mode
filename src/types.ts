@@ -10,6 +10,8 @@ export interface PhaseProfileConfig {
 }
 
 export interface PlanModeConfig {
+  /** Exact non-workflow tool allowlist for Plan Mode. Undefined uses the built-in defaults. */
+  tools?: string[];
   planning: PhaseProfileConfig;
   execution: PhaseProfileConfig;
 }
@@ -57,6 +59,8 @@ export interface PlanModeState {
   stage: PlanStage;
   plan?: PlanDocument;
   baseline?: SessionBaseline;
+  /** Effective non-workflow tools selected when this Plan session started. */
+  planningTools?: string[];
   planningProfile?: ModelProfile;
   executionProfile?: ModelProfile;
   executionTools?: string[];
@@ -68,7 +72,12 @@ export interface PlanModeState {
 }
 
 export interface LoadedPlanModeConfig {
+  /** Effective merged configuration. */
   config: PlanModeConfig;
+  /** Sanitized global file contents before project overrides. */
+  globalConfig: PlanModeConfig;
+  /** Sanitized project file contents before merging. */
+  projectConfig: PlanModeConfig;
   globalPath: string;
   projectPath: string;
   warnings: string[];

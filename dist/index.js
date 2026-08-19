@@ -2,13 +2,15 @@ import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { ASK_USER_QUESTION_TOOL, ENTER_PLAN_MODE_TOOL, EXIT_PLAN_MODE_TOOL, PLAN_CONTINUE_MESSAGE, PLAN_HANDOFF_MESSAGE, PLAN_STATE_ENTRY, PLAN_STATUS_KEY, PLAN_WIDGET_KEY, PLAN_WRITE_TOOL, STATE_SCHEMA_VERSION, } from "./constants.js";
 import { loadPlanModeConfig } from "./config.js";
+import { openPlanModeConfig } from "./config-ui.js";
 import { approvePlan, buildExecutionHandoffMessage, buildExecutionState, buildHandoffDetails, } from "./handoff.js";
 import { createPlanDocument, ensurePlanDocument, isManagedPlanDocument, isPlanReady, refreshPlanDocument, updatePlanDocument, } from "./plan-store.js";
 import { applyProfile, captureCurrentProfile, resolvePhaseProfile } from "./profile.js";
 import { buildExecutionSystemPrompt, buildPlanningSystemPrompt, buildReadySystemPrompt, } from "./prompts.js";
 import { restorePlanModeState, touchState } from "./state.js";
-import { buildExecutionTools, buildIdleTools, buildPlanningTools, getMissingPlanningTools, isPlanningToolAllowed, } from "./tool-set.js";
+import { buildExecutionTools, buildIdleTools, buildPlanningTools, getEffectivePlanningToolSelection, getMissingPlanningTools, isPlanningToolAllowed, } from "./tool-set.js";
 export * from "./config.js";
+export * from "./config-ui.js";
 export * from "./constants.js";
 export * from "./handoff.js";
 export * from "./plan-store.js";
@@ -85,6 +87,9 @@ export function registerClaudePlanMode(pi) {
     function allToolNames() {
         return new Set(pi.getAllTools().map((tool) => tool.name));
     }
+    function selectedPlanningTools(current = state, names = allToolNames()) {
+        return getEffectivePlanningToolSelection(current?.planningTools, names);
+    }
     function updateUi(ctx) {
         const planModeActive = state?.stage === "planning" || state?.stage === "ready";
         ctx.ui.setWidget(PLAN_WIDGET_KEY, undefined);
@@ -104,12 +109,12 @@ export function registerClaudePlanMode(pi) {
     async function applyStateRuntime(current, ctx) {
         const names = allToolNames();
         if ((current.stage === "planning" || current.stage === "ready") && current.baseline && current.planningProfile) {
-            const missing = getMissingPlanningTools(names);
+            const planningTools = selectedPlanningTools(current, names);
+            const missing = getMissingPlanningTools(planningTools, names);
             if (missing.length > 0) {
-                throw new Error(`Cannot restore Plan Mode because these tools are not registered: ${missing.join(", ")}. ` +
-                    "Keep Pi's read/grep/find/ls tools registered (they may remain inactive outside Plan Mode).");
+                ctx.ui.notify(`Configured Plan Mode tools are not registered and will be unavailable: ${missing.join(", ")}.`, "warning");
             }
-            pi.setActiveTools(buildPlanningTools(names));
+            pi.setActiveTools(buildPlanningTools(planningTools, names));
             await applyProfile(pi, ctx, current.planningProfile, current.baseline.profile, "Planning profile");
             return;
         }
@@ -125,6 +130,33 @@ export function registerClaudePlanMode(pi) {
             return;
         }
         pi.setActiveTools(buildIdleTools(pi.getActiveTools(), names));
+    }
+    async function applySavedConfiguration(ctx) {
+        const current = state;
+        if (!current?.baseline)
+            return;
+        if (current.stage !== "planning" && current.stage !== "ready") {
+            if (current.stage === "executing") {
+                ctx.ui.notify("The configuration was saved and will apply the next time Plan Mode starts; the approved execution snapshot was not changed.", "info");
+            }
+            return;
+        }
+        const loaded = loadPlanModeConfig(ctx.cwd, {
+            agentDir: getAgentDir(),
+            configDirName: CONFIG_DIR_NAME,
+            loadProjectConfig: ctx.isProjectTrusted(),
+        });
+        warnConfig(ctx, loaded.warnings);
+        const names = allToolNames();
+        const planningTools = getEffectivePlanningToolSelection(loaded.config.tools, names);
+        const next = commitState({
+            ...current,
+            planningTools,
+            planningProfile: resolvePhaseProfile(current.baseline.profile, loaded.config.planning),
+            executionProfile: resolvePhaseProfile(current.baseline.profile, loaded.config.execution),
+        }, ctx);
+        await applyStateRuntime(next, ctx);
+        ctx.ui.notify("Plan Mode configuration was applied to the current planning session.", "info");
     }
     async function restoreBranchRuntime(ctx, fallbackState, recoverMissingHandoff = true) {
         state = restorePlanModeState(getCurrentBranch(ctx));
@@ -213,19 +245,11 @@ export function registerClaudePlanMode(pi) {
             if (!ctx.hasUI) {
                 return { entered: false, message: "Interactive Plan Mode confirmation is unavailable. Run /plan explicitly." };
             }
-            const accepted = await ctx.ui.confirm("Enter Plan Mode?", "Switch to Pi's structured read-only tools and create a canonical implementation plan?");
+            const accepted = await ctx.ui.confirm("Enter Plan Mode?", "Switch to the configured Plan tool allowlist and create a canonical implementation plan?");
             if (!accepted)
                 return { entered: false, message: "The user declined Plan Mode." };
         }
         const names = allToolNames();
-        const missing = getMissingPlanningTools(names);
-        if (missing.length > 0) {
-            const message = `Plan Mode cannot start because these tools are unavailable: ${missing.join(", ")}. ` +
-                "Do not launch Pi with --no-builtin-tools or a strict --tools list that removes read/grep/find/ls, " +
-                "and do not permanently disable those four tools.";
-            ctx.ui.notify(message, "error");
-            return { entered: false, message };
-        }
         const baselineTools = buildIdleTools(pi.getActiveTools(), names);
         const baselineProfile = captureCurrentProfile(pi, ctx);
         const loaded = loadPlanModeConfig(ctx.cwd, {
@@ -234,6 +258,11 @@ export function registerClaudePlanMode(pi) {
             loadProjectConfig: ctx.isProjectTrusted(),
         });
         warnConfig(ctx, loaded.warnings);
+        const planningTools = getEffectivePlanningToolSelection(loaded.config.tools, names);
+        const missing = getMissingPlanningTools(planningTools, names);
+        if (missing.length > 0) {
+            ctx.ui.notify(`Configured Plan Mode tools are not registered and will be skipped: ${missing.join(", ")}.`, "warning");
+        }
         const planningProfile = resolvePhaseProfile(baselineProfile, loaded.config.planning);
         const executionProfile = resolvePhaseProfile(baselineProfile, loaded.config.execution);
         const plan = await createPlanDocument(getAgentDir(), options.reason);
@@ -242,12 +271,13 @@ export function registerClaudePlanMode(pi) {
             stage: "planning",
             plan,
             baseline: { profile: baselineProfile, tools: baselineTools },
+            planningTools,
             planningProfile,
             executionProfile,
             executionTools: baselineTools,
             updatedAt: new Date().toISOString(),
         }, ctx);
-        pi.setActiveTools(buildPlanningTools(names));
+        pi.setActiveTools(buildPlanningTools(planningTools, names));
         await applyProfile(pi, ctx, planningProfile, baselineProfile, "Planning profile");
         updateUi(ctx);
         return {
@@ -502,7 +532,7 @@ export function registerClaudePlanMode(pi) {
     pi.registerTool({
         name: ENTER_PLAN_MODE_TOOL,
         label: "Enter Plan Mode",
-        description: "Ask the user to enter a read-only planning workflow before implementing a non-trivial task. The Plan session uses read, grep, find, and ls plus a canonical plan file.",
+        description: "Ask the user to enter a planning workflow before implementing a non-trivial task. Plan Mode activates the configured tool allowlist plus the canonical plan workflow tools.",
         promptSnippet: "Enter a read-only planning workflow before complex implementation work",
         promptGuidelines: [
             "Use EnterPlanMode for non-trivial features, multi-file changes, architecture decisions, or when the user asks for a plan first.",
@@ -653,13 +683,13 @@ export function registerClaudePlanMode(pi) {
                 return;
             }
             if (normalized === "config") {
-                const loaded = loadPlanModeConfig(ctx.cwd, {
+                await ctx.waitForIdle();
+                const result = await openPlanModeConfig(pi, ctx, {
                     agentDir: getAgentDir(),
                     configDirName: CONFIG_DIR_NAME,
-                    loadProjectConfig: ctx.isProjectTrusted(),
                 });
-                warnConfig(ctx, loaded.warnings);
-                ctx.ui.notify(`Global: ${loaded.globalPath}\nProject: ${loaded.projectPath}`, "info");
+                if (result.saved)
+                    await applySavedConfiguration(ctx);
                 return;
             }
             if (normalized === "approve") {
@@ -714,9 +744,11 @@ export function registerClaudePlanMode(pi) {
         pendingPlanningContinuation = false;
         if (state?.stage !== "planning" || !state.plan || ctx.hasPendingMessages())
             return;
+        const toolNames = selectedPlanningTools(state);
+        const toolSummary = toolNames.length > 0 ? toolNames.join(", ") : "no optional investigation tools";
         pi.sendMessage({
             customType: PLAN_CONTINUE_MESSAGE,
-            content: `Continue planning the user's request in Plan Mode. Explore the repository with read, grep, find, and ls. ` +
+            content: `Continue planning the user's request in Plan Mode using the configured tools (${toolSummary}). ` +
                 `Maintain the canonical plan at ${state.plan.path} with ${PLAN_WRITE_TOOL} according to the final plan content contract, ` +
                 `and call ${EXIT_PLAN_MODE_TOOL} alone when the plan is complete and unambiguous.`,
             display: false,
@@ -731,8 +763,9 @@ export function registerClaudePlanMode(pi) {
         if (!state)
             return;
         const names = allToolNames();
+        const planningTools = selectedPlanningTools(state, names);
         const modePrompt = state.stage === "planning"
-            ? buildPlanningSystemPrompt(state, names.has(ASK_USER_QUESTION_TOOL))
+            ? buildPlanningSystemPrompt(state, planningTools, planningTools.includes(ASK_USER_QUESTION_TOOL) && names.has(ASK_USER_QUESTION_TOOL))
             : state.stage === "ready"
                 ? buildReadySystemPrompt(state)
                 : state.stage === "executing"
@@ -767,12 +800,12 @@ export function registerClaudePlanMode(pi) {
         if (state?.stage !== "planning" && state?.stage !== "ready")
             return;
         const names = allToolNames();
-        if (isPlanningToolAllowed(event.toolName, names))
+        const planningTools = selectedPlanningTools(state, names);
+        if (isPlanningToolAllowed(event.toolName, planningTools, names))
             return;
         return {
             block: true,
-            reason: `Plan Mode blocks ${event.toolName}. Use read, grep, find, ls, ${PLAN_WRITE_TOOL}, ` +
-                `${ASK_USER_QUESTION_TOOL} (when installed), or ${EXIT_PLAN_MODE_TOOL}.`,
+            reason: `Plan Mode blocks ${event.toolName}. Allowed tools: ${buildPlanningTools(planningTools, names).join(", ")}.`,
         };
     });
     pi.on("model_select", (event, ctx) => {
