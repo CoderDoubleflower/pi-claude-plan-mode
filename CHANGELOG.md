@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Align the internal planning prompt, initial template, and readiness checks with Claude Code-style phases and a final Plan contract: Context, ordered file-specific implementation steps, existing code to reuse, and Verification.
+- Keep legacy Objective/Validation headings readable when resuming older Plan documents.
+- Reduce persistent TUI chrome to one stable `Plan Mode` status; remove revision, path, ready/executing stage labels, and the above-editor Plan widget.
+
 ## 0.1.0
 
 - Initial implementation of Claude Code-style Plan Mode for Pi.

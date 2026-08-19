@@ -21,12 +21,33 @@ Canonical plan:
 - Revision: ${state.plan.revision}
 - SHA-256: ${state.plan.hash}
 
-Planning workflow:
-1. Explore the repository and identify the relevant architecture and existing patterns.
-2. ${questionInstruction}
-3. Record concrete findings, design decisions, files, ordered implementation steps, validation, and risks in the canonical plan.
-4. Replace the initial template completely; do not leave placeholder text or the template marker.
-5. When the plan is complete, call ${EXIT_PLAN_MODE_TOOL} by itself in a tool-call turn.
+Plan workflow:
+
+### Phase 1: Initial Understanding
+- Explore the repository thoroughly enough to understand the relevant architecture, existing conventions, and complete code paths.
+- Actively search for existing functions, types, utilities, and analogous features that should be reused instead of proposing duplicate code.
+- Resolve material ambiguity before committing to an approach. ${questionInstruction}
+
+### Phase 2: Design
+- Choose one recommended implementation that fits the existing architecture.
+- Work out the affected files, data/control flow, dependencies, sequencing, compatibility constraints, and meaningful risks.
+
+### Phase 3: Review
+- Read the critical files yourself rather than relying only on search snippets.
+- Check that the design satisfies the user's original request without unnecessary scope.
+- Resolve any remaining material question before writing the final plan.
+
+### Phase 4: Final Plan
+Replace the initial template completely with ${PLAN_WRITE_TOOL}. The final plan must follow this content contract:
+- Include a required \`## Context\` section with one concise paragraph explaining why the change is needed, the problem it addresses, and the intended outcome.
+- Include a required \`## Implementation Steps\` section with ordered numbered steps. Each step must identify the exact file path or paths involved, describe the concrete change, name existing functions, types, or utilities to reuse with their source paths, and note sequencing or dependencies when relevant.
+- Include a required \`## Verification\` section with the exact supported commands and end-to-end behaviors that will confirm the implementation works. Do not invent commands that are not supported by the repository.
+- Include only the recommended approach. Do not list rejected alternatives, unresolved options, raw exploration notes, or speculative work.
+- Keep the plan easy to scan and detailed enough that another agent can implement it without rediscovering the design.
+- Do not restate the user's request as filler, include placeholder text, or claim that implementation or verification already happened.
+
+### Phase 5: Finish
+When the plan is complete and unambiguous, call ${EXIT_PLAN_MODE_TOOL} by itself in a tool-call turn.
 
 Do not begin implementation until the user approves the plan through /plan-approve.`;
 }

@@ -80,12 +80,9 @@ const planWriteSchema = Type.Object(
 const emptySchema = Type.Object({}, { additionalProperties: false });
 
 function formatStateSummary(state: PlanModeState | undefined): string {
-  if (!state || state.stage === "idle") return "Plan mode is inactive.";
-  const revision = state.plan ? ` r${state.plan.revision}` : "";
-  if (state.stage === "planning") return `Plan mode is active${revision}.`;
-  if (state.stage === "ready") return `Plan${revision} is ready for /plan-approve.`;
-  if (state.stage === "executing") return `Executing approved plan${revision}.`;
-  return `Plan${revision} was handed off to a new execution session.`;
+  return state?.stage === "planning" || state?.stage === "ready"
+    ? "Plan Mode is active."
+    : "Plan Mode is inactive.";
 }
 
 function executionSessionName(state: PlanModeState): string {
@@ -141,47 +138,11 @@ export function registerClaudePlanMode(pi: ExtensionAPI): void {
   }
 
   function updateUi(ctx: ExtensionContext): void {
-    const current = state;
-    if (!current || current.stage === "idle" || current.stage === "handed_off") {
-      ctx.ui.setStatus(PLAN_STATUS_KEY, undefined);
-      ctx.ui.setWidget(PLAN_WIDGET_KEY, undefined);
-      return;
-    }
-
-    if (current.stage === "planning") {
-      const revision = current.plan?.revision ?? 0;
-      ctx.ui.setStatus(PLAN_STATUS_KEY, ctx.ui.theme.fg("warning", `plan:r${revision}`));
-      ctx.ui.setWidget(
-        PLAN_WIDGET_KEY,
-        [
-          ctx.ui.theme.fg("warning", `Plan Mode · revision ${revision}`),
-          ctx.ui.theme.fg("dim", current.plan?.path ?? "Plan file unavailable"),
-        ],
-        { placement: "aboveEditor" },
-      );
-      return;
-    }
-
-    if (current.stage === "ready") {
-      const revision = current.plan?.revision ?? 0;
-      ctx.ui.setStatus(PLAN_STATUS_KEY, ctx.ui.theme.fg("accent", `plan:ready r${revision}`));
-      ctx.ui.setWidget(
-        PLAN_WIDGET_KEY,
-        [
-          ctx.ui.theme.fg("accent", `Plan r${revision} is ready for approval`),
-          ctx.ui.theme.fg("muted", "Run /plan-approve to execute, edit, or continue planning."),
-        ],
-        { placement: "aboveEditor" },
-      );
-      return;
-    }
-
-    const revision = current.approved?.revision ?? current.plan?.revision ?? 0;
-    ctx.ui.setStatus(PLAN_STATUS_KEY, ctx.ui.theme.fg("success", `plan:executing r${revision}`));
-    ctx.ui.setWidget(
-      PLAN_WIDGET_KEY,
-      [ctx.ui.theme.fg("success", `Executing approved plan revision ${revision}`)],
-      { placement: "aboveEditor" },
+    const planModeActive = state?.stage === "planning" || state?.stage === "ready";
+    ctx.ui.setWidget(PLAN_WIDGET_KEY, undefined);
+    ctx.ui.setStatus(
+      PLAN_STATUS_KEY,
+      planModeActive ? ctx.ui.theme.fg("warning", "Plan Mode") : undefined,
     );
   }
 
@@ -365,7 +326,7 @@ export function registerClaudePlanMode(pi: ExtensionAPI): void {
     const executionProfile = resolvePhaseProfile(baselineProfile, loaded.config.execution);
     const plan = await createPlanDocument(getAgentDir(), options.reason);
 
-    const next = commitState(
+    commitState(
       {
         schemaVersion: STATE_SCHEMA_VERSION,
         stage: "planning",
@@ -384,7 +345,7 @@ export function registerClaudePlanMode(pi: ExtensionAPI): void {
     updateUi(ctx);
     return {
       entered: true,
-      message: `Plan Mode enabled. Canonical plan: ${next.plan?.path} (revision ${next.plan?.revision}).`,
+      message: "Plan Mode enabled.",
     };
   }
 
@@ -711,12 +672,14 @@ export function registerClaudePlanMode(pi: ExtensionAPI): void {
     name: PLAN_WRITE_TOOL,
     label: "Write Plan",
     description:
-      "Replace the complete canonical Plan Mode Markdown document. This tool has no path parameter and cannot modify project files.",
-    promptSnippet: "Write the canonical implementation plan document",
+      "Replace the complete canonical Plan Mode Markdown document. The final plan must contain Context, ordered Implementation Steps, and Verification, and it must present only the recommended implementation.",
+    promptSnippet: "Write the complete, executable canonical implementation plan",
     promptGuidelines: [
-      "Use plan_write only in Plan Mode.",
-      "Pass the complete plan, not a patch or fragment.",
-      "Remove all initial template placeholders before requesting approval.",
+      "Use plan_write only in Plan Mode and pass the complete plan, not a patch or fragment.",
+      "Use the required sections: ## Context, ## Implementation Steps, and ## Verification.",
+      "Name exact file paths and existing functions, types, or utilities to reuse in the ordered implementation steps.",
+      "Include only the recommended approach; remove alternatives, unresolved options, raw exploration notes, and all template placeholders.",
+      "Keep the plan concise enough to scan and detailed enough to implement without rediscovering the design.",
     ],
     parameters: planWriteSchema,
     executionMode: "sequential",
@@ -751,10 +714,10 @@ export function registerClaudePlanMode(pi: ExtensionAPI): void {
     name: EXIT_PLAN_MODE_TOOL,
     label: "Exit Plan Mode",
     description:
-      "Mark the canonical plan ready for user approval. This ends the planning agent run; the user then runs /plan-approve.",
+      "Mark the complete, unambiguous canonical plan ready for user approval. This ends the planning agent run; the user then runs /plan-approve.",
     promptSnippet: "Finish planning and ask the user to review the canonical plan",
     promptGuidelines: [
-      "Call ExitPlanMode only after the canonical plan is complete.",
+      "Call ExitPlanMode only after all material questions are resolved and the canonical plan satisfies the final plan content contract.",
       "Call ExitPlanMode alone in its tool-call turn.",
       "Do not begin implementation after calling it.",
     ],
@@ -914,8 +877,8 @@ export function registerClaudePlanMode(pi: ExtensionAPI): void {
         customType: PLAN_CONTINUE_MESSAGE,
         content:
           `Continue planning the user's request in Plan Mode. Explore the repository with read, grep, find, and ls. ` +
-          `Maintain the canonical plan at ${state.plan.path} with ${PLAN_WRITE_TOOL}, and call ${EXIT_PLAN_MODE_TOOL} ` +
-          "alone when the plan is complete.",
+          `Maintain the canonical plan at ${state.plan.path} with ${PLAN_WRITE_TOOL} according to the final plan content contract, ` +
+          `and call ${EXIT_PLAN_MODE_TOOL} alone when the plan is complete and unambiguous.`,
         display: false,
         details: { planId: state.plan.id, revision: state.plan.revision },
       },
