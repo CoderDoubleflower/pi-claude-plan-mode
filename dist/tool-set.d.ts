@@ -1,5 +1,11 @@
+export declare function getDefaultPlanningTools(allToolNames: ReadonlySet<string>): string[];
+export declare function getEffectivePlanningToolSelection(configuredTools: readonly string[] | undefined, allToolNames: ReadonlySet<string>): string[];
+export declare function getConfigurablePlanningTools(allToolNames: ReadonlySet<string>): string[];
 export declare function buildIdleTools(current: readonly string[], allToolNames: ReadonlySet<string>): string[];
 export declare function getMissingPlanningTools(allToolNames: ReadonlySet<string>): string[];
+export declare function getMissingPlanningTools(selectedTools: readonly string[], allToolNames: ReadonlySet<string>): string[];
 export declare function buildPlanningTools(allToolNames: ReadonlySet<string>): string[];
+export declare function buildPlanningTools(selectedTools: readonly string[], allToolNames: ReadonlySet<string>): string[];
 export declare function buildExecutionTools(baseline: readonly string[], allToolNames: ReadonlySet<string>): string[];
 export declare function isPlanningToolAllowed(toolName: string, allToolNames: ReadonlySet<string>): boolean;
+export declare function isPlanningToolAllowed(toolName: string, selectedTools: readonly string[], allToolNames: ReadonlySet<string>): boolean;

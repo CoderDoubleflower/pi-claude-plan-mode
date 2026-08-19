@@ -60,6 +60,8 @@ export function isPlanModeState(value) {
             return false;
         }
     }
+    if (value.planningTools !== undefined && !isStringArray(value.planningTools))
+        return false;
     if (value.planningProfile !== undefined && !isProfile(value.planningProfile))
         return false;
     if (value.executionProfile !== undefined && !isProfile(value.executionProfile))

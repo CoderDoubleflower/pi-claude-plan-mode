@@ -8,6 +8,12 @@ export interface ModelLike {
 
 export interface ModelRegistryLike {
   find(provider: string, model: string): ModelLike | undefined;
+  getAvailable?(): ModelLike[];
+}
+
+export interface ScopedModelLike {
+  model: ModelLike;
+  thinkingLevel?: ThinkingLevel;
 }
 
 export interface SessionEntryLike {
@@ -61,6 +67,7 @@ export interface ExtensionContext {
   sessionManager: ReadonlySessionManagerLike;
   modelRegistry: ModelRegistryLike;
   model: ModelLike | undefined;
+  scopedModels?: readonly ScopedModelLike[];
   thinkingLevel?: ThinkingLevel;
   isIdle(): boolean;
   isProjectTrusted(): boolean;

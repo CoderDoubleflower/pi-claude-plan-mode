@@ -68,6 +68,7 @@ export function isPlanModeState(value: unknown): value is PlanModeState {
       return false;
     }
   }
+  if (value.planningTools !== undefined && !isStringArray(value.planningTools)) return false;
   if (value.planningProfile !== undefined && !isProfile(value.planningProfile)) return false;
   if (value.executionProfile !== undefined && !isProfile(value.executionProfile)) return false;
   if (value.executionTools !== undefined && !isStringArray(value.executionTools)) return false;

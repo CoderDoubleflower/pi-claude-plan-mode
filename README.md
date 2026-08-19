@@ -1,13 +1,13 @@
 # pi-claude-plan-mode
 
-在 Pi 中复刻 Claude Code 风格的 Plan Mode：先用结构化只读工具探索代码库，把方案写入独立的 canonical plan 文件，显式交给用户审批，再选择保留上下文执行，或清空上下文并创建一个新的 execution session。
+在 Pi 中复刻 Claude Code 风格的 Plan Mode：先用可配置的 Plan 工具白名单探索代码库，把方案写入独立的 canonical plan 文件，显式交给用户审批，再选择保留上下文执行，或清空上下文并创建一个新的 execution session。
 
 本插件面向 Pi `0.84.2+`，尤其适合常规工作流只启用以下两个工具的环境：
 
 - `shell_command`
 - `apply_patch`
 
-进入 Plan Mode 后不会尝试分析或限制任意 Shell 命令，而是临时切换到 Pi 官方的结构化只读工具。
+进入 Plan Mode 后，插件会临时切换到用户配置的工具白名单。默认仍使用 Pi 官方的结构化只读工具，但也可以在配置界面中加入搜索、GitHub、MCP 或其他已注册工具。
 
 ## 核心行为
 
@@ -20,25 +20,30 @@ EnterPlanMode
 ask_user_question（若已安装）
 ```
 
-Plan Mode 中只暴露：
+Plan Mode 的默认白名单为：
 
 ```text
 read
 grep
 find
 ls
+ask_user_question（若已安装）
+```
+
+此外，以下 workflow 工具由插件固定管理，不需要在配置界面中选择：
+
+```text
 plan_write
 ExitPlanMode
-ask_user_question（若已安装）
 ```
 
 其中：
 
-- `shell_command` 在 Plan Mode 中不可见；
-- `apply_patch` 在 Plan Mode 中不可见；
+- 未进入白名单的工具在 Plan Mode 中不可见，并在 `tool_call` 阶段再次阻断；
 - `plan_write` 没有路径参数，只能完整替换当前 canonical plan 文件；
-- 其他未知或后来注册的工具在 Plan Mode 中默认阻断；
-- `EnterPlanMode` 与 `ExitPlanMode` 必须单独出现在一个 tool-call turn 中。
+- `EnterPlanMode` 在 Plan Mode 内不会再次暴露；
+- `EnterPlanMode` 与 `ExitPlanMode` 必须单独出现在一个 tool-call turn 中；
+- 即使白名单包含 `shell_command`、`apply_patch` 等能力，Plan 提示词仍明确禁止实现修改和副作用。允许此类工具意味着用户接受其内部操作无法由插件进一步沙箱化。
 
 Plan 文件默认保存到：
 
@@ -70,23 +75,9 @@ pi install -l git:github.com/CoderDoubleflower/pi-claude-plan-mode
 
 ## 前置条件
 
-Plan Mode 需要以下 Pi 内置工具仍然存在于运行时工具注册表：
+默认配置使用 Pi 内置的 `read/grep/find/ls`，因此这些工具需要保留在运行时注册表中；它们可以在普通模式保持 inactive。若启动参数或工具管理插件彻底移除了默认工具，可以先通过 `/plan config` 改用当前实际注册的其他工具。
 
-```text
-read
-grep
-find
-ls
-```
-
-它们可以在普通模式下保持 inactive，但不能被从注册表彻底排除。因此不要使用会删除这些工具的启动方式，例如：
-
-```text
---no-builtin-tools
---tools shell_command,apply_patch
-```
-
-也不要在工具管理插件中把 `read/grep/find/ls` 设为永久禁用。推荐做法是：普通模式只让它们 inactive，Plan Mode 进入时由本插件临时激活。
+配置中选中的工具如果当前未注册，进入或恢复 Plan Mode 时会显示 warning，并跳过该工具；`plan_write` 与 `ExitPlanMode` 始终由插件注册和保留。
 
 ## 使用方式
 
@@ -110,13 +101,13 @@ ls
 
 ### 模型主动进入
 
-插件注册 `EnterPlanMode`。模型遇到多文件功能、架构调整或需要先探索的任务时，可以请求进入 Plan Mode；TUI 会要求用户确认。确认后，当前 agent run 会以 terminating tool result 正常结束，插件再自动发起一个隐藏的 planning continuation，使下一次模型调用从一开始就只看到 `read/grep/find/ls` 和 Plan workflow 工具。
+插件注册 `EnterPlanMode`。模型遇到多文件功能、架构调整或需要先探索的任务时，可以请求进入 Plan Mode；TUI 会要求用户确认。确认后，当前 agent run 会以 terminating tool result 正常结束，插件再自动发起一个隐藏的 planning continuation，使下一次模型调用从一开始就只看到配置的 Plan 工具白名单和 workflow 工具。
 
 ### 规划完成
 
 模型必须：
 
-1. 用 `read/grep/find/ls` 探索代码，并主动寻找可以复用的既有实现；
+1. 用配置的 Plan 工具探索代码，并主动寻找可以复用的既有实现；
 2. 解决会影响实现方案的关键歧义；
 3. 用 `plan_write` 写入完整计划；
 4. 单独调用 `ExitPlanMode`。
@@ -216,7 +207,28 @@ S2 的 handoff 中会包含：
 
 如果创建新 session 被其他扩展取消，原 Plan session 会恢复为 ready 状态，不会丢失计划。
 
-## 模型和思考强度配置
+## Plan 配置界面
+
+执行以下命令会打开交互式配置界面：
+
+```text
+/plan config
+```
+
+界面可以分别编辑全局配置和受信任项目的项目配置，并提供：
+
+- Plan Mode 允许使用的工具白名单，多次选择即可勾选或取消；
+- Plan 模型；
+- Plan 思考强度；
+- Execute 模型；
+- Execute 思考强度；
+- 当前 scope 的重置、JSON 预览和 effective configuration 预览。
+
+模型列表来自当前 session 的 scoped models；未配置 model scope 时使用 `modelRegistry.getAvailable()` 返回的真实可用模型。项目配置按字段覆盖全局配置，工具白名单则以完整数组覆盖；选择 inherit 会继续使用上一级配置或内置默认值。
+
+在 planning/ready 状态保存配置后，新的工具白名单、Plan profile 和 Execute profile 会立即应用到当前规划 session。已进入 execution 的 approved snapshot 不会被中途修改，新配置会在下一次 Plan workflow 生效。
+
+### 配置文件
 
 全局配置：
 
@@ -236,6 +248,13 @@ S2 的 handoff 中会包含：
 
 ```json
 {
+  "tools": [
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "ask_user_question"
+  ],
   "planning": {
     "provider": "openai-codex",
     "model": "gpt-5.2-codex",
@@ -306,7 +325,7 @@ max
 /plan approve [action]        /plan-approve 的别名
 /plan off                     取消 Plan workflow 并恢复 baseline
 /plan finish                  结束 execution profile 并恢复 baseline
-/plan config                  显示全局和项目配置路径
+/plan config                  打开工具、Plan/Execute 模型与思考强度配置界面
 /plan-approve [action]        审批 ready plan
 ```
 
@@ -323,6 +342,7 @@ pi --plan
 - workflow stage；
 - plan 文件、revision 和 hash；
 - baseline profile 和工具快照；
+- 当前 Plan session 固化的工具白名单；
 - planning/execution profile；
 - ready/approved snapshot；
 - planning session 与 execution session 的来源关系。
@@ -370,8 +390,9 @@ npm test
 Plan Mode 的主要不变量是：
 
 ```text
-项目探索只能使用结构化 read/grep/find/ls
-唯一写入能力是无路径参数的 plan_write
+只有配置白名单中的工具会在 Plan Mode 暴露
+plan_write 与 ExitPlanMode 由插件固定管理
+提示词始终禁止进入实现和执行副作用
 ```
 
-工具切换本身不是操作系统沙箱；Pi extension 仍运行在当前用户权限下。但与对任意 `shell_command` 做正则或 AST 判定相比，这个设计不会因 Shell 语义产生大量误伤，也不会把未知写命令误判为只读。插件不会注册额外的 Git 查询工具；Plan 阶段的仓库探索范围就是 `read/grep/find/ls`。
+工具切换本身不是操作系统沙箱；Pi extension 与被允许的工具仍运行在当前用户权限下。默认 `read/grep/find/ls` 提供最强的结构化只读边界。用户主动把 Shell、编辑、网络写入或其他有副作用的工具加入白名单后，插件只能限制“是否可调用该工具”，无法分析和沙箱化工具内部的每一种操作，因此应只选择自己信任且确实需要用于规划的工具。

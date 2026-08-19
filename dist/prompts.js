@@ -1,7 +1,21 @@
-import { ASK_USER_QUESTION_TOOL, EXIT_PLAN_MODE_TOOL, PLAN_WRITE_TOOL } from "./constants.js";
-export function buildPlanningSystemPrompt(state, hasQuestionTool) {
+import { ASK_USER_QUESTION_TOOL, EXIT_PLAN_MODE_TOOL, PLAN_WRITE_TOOL, READ_ONLY_PLAN_TOOLS, } from "./constants.js";
+function formatToolNames(toolNames) {
+    return toolNames.length > 0
+        ? toolNames.map((name) => `\`${name}\``).join(", ")
+        : "none";
+}
+export function buildPlanningSystemPrompt(state, allowedToolsOrHasQuestionTool, maybeHasQuestionTool) {
     if (!state.plan)
         return "";
+    const hasQuestionTool = typeof allowedToolsOrHasQuestionTool === "boolean"
+        ? allowedToolsOrHasQuestionTool
+        : maybeHasQuestionTool === true;
+    const allowedTools = typeof allowedToolsOrHasQuestionTool === "boolean"
+        ? state.planningTools ?? [
+            ...READ_ONLY_PLAN_TOOLS,
+            ...(hasQuestionTool ? [ASK_USER_QUESTION_TOOL] : []),
+        ]
+        : [...allowedToolsOrHasQuestionTool];
     const questionInstruction = hasQuestionTool
         ? `Use ${ASK_USER_QUESTION_TOOL} when the user's decision materially affects the plan.`
         : "Ask concise clarification questions in normal text when a user decision materially affects the plan.";
@@ -12,9 +26,10 @@ You are planning, not implementing.
 Hard constraints:
 - Do not modify project files, configuration, dependencies, Git state, external systems, or running services.
 - The only writable artifact is the canonical plan document below, and it may only be changed with ${PLAN_WRITE_TOOL}.
-- Use only the structured read-only tools read, grep, find, and ls for repository exploration.
+- The configured Plan tool allowlist is: ${formatToolNames(allowedTools)}.
+- Use allowed tools only for investigation, clarification, and planning. A tool being allowed does not grant permission to implement changes or perform side effects.
 - Do not claim that code was changed or tests were run.
-- Do not attempt to bypass unavailable tools.
+- Do not attempt to bypass unavailable or blocked tools.
 
 Canonical plan:
 - Path: ${state.plan.path}

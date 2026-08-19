@@ -1,5 +1,6 @@
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 export * from "./config.js";
+export * from "./config-ui.js";
 export * from "./constants.js";
 export * from "./handoff.js";
 export * from "./plan-store.js";

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add an interactive `/plan config` UI for global/project tool allowlists, Plan/Execute models, and thinking levels.
+- Persist the selected Plan tool allowlist in session state, restore it across branches/resume, and apply saved configuration immediately to active planning sessions.
+- Populate model selectors from scoped or currently available Pi models and preserve inherited configuration semantics.
+
 - Align the internal planning prompt, initial template, and readiness checks with Claude Code-style phases and a final Plan contract: Context, ordered file-specific implementation steps, existing code to reuse, and Verification.
 - Keep legacy Objective/Validation headings readable when resuming older Plan documents.
 - Reduce persistent TUI chrome to one stable `Plan Mode` status; remove revision, path, ready/executing stage labels, and the above-editor Plan widget.
