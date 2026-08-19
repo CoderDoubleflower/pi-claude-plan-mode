@@ -1,0 +1,75 @@
+{
+  "name": "pi-claude-plan-mode",
+  "version": "0.1.0",
+  "description": "Claude Code-style plan mode for Pi with read-only planning tools, explicit approval, and fresh-session execution handoff.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "clean": "rm -rf dist",
+    "ensure:test-deps": "node scripts/ensure-test-deps.mjs",
+    "build": "npm run ensure:test-deps && npm run clean && tsc -p tsconfig.json",
+    "typecheck": "npm run ensure:test-deps && tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "prepack": "npm test"
+  },
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "plan-mode",
+    "claude-code",
+    "coding-agent"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CoderDoubleflower/pi-claude-plan-mode.git"
+  },
+  "homepage": "https://github.com/CoderDoubleflower/pi-claude-plan-mode#readme",
+  "bugs": {
+    "url": "https://github.com/CoderDoubleflower/pi-claude-plan-mode/issues"
+  },
+  "pi": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.84.2",
+    "typebox": ">=1.3.7"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.2",
+    "typebox": "^1.3.7",
+    "typescript": "^5.8.3",
+    "@types/node": "^22.15.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

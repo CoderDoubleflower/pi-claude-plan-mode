@@ -1,0 +1,1044 @@
+import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import {
+  ASK_USER_QUESTION_TOOL,
+  ENTER_PLAN_MODE_TOOL,
+  EXIT_PLAN_MODE_TOOL,
+  PLAN_CONTINUE_MESSAGE,
+  PLAN_HANDOFF_MESSAGE,
+  PLAN_STATE_ENTRY,
+  PLAN_STATUS_KEY,
+  PLAN_WIDGET_KEY,
+  PLAN_WRITE_TOOL,
+  STATE_SCHEMA_VERSION,
+} from "./constants.js";
+import { loadPlanModeConfig } from "./config.js";
+import {
+  approvePlan,
+  buildExecutionHandoffMessage,
+  buildExecutionState,
+  buildHandoffDetails,
+} from "./handoff.js";
+import {
+  createPlanDocument,
+  ensurePlanDocument,
+  isManagedPlanDocument,
+  isPlanReady,
+  refreshPlanDocument,
+  updatePlanDocument,
+} from "./plan-store.js";
+import { applyProfile, captureCurrentProfile, resolvePhaseProfile } from "./profile.js";
+import {
+  buildExecutionSystemPrompt,
+  buildPlanningSystemPrompt,
+  buildReadySystemPrompt,
+} from "./prompts.js";
+import { restorePlanModeState, touchState } from "./state.js";
+import {
+  buildExecutionTools,
+  buildIdleTools,
+  buildPlanningTools,
+  getMissingPlanningTools,
+  isPlanningToolAllowed,
+} from "./tool-set.js";
+import type { PlanModeState, ReadyPlanSnapshot } from "./types.js";
+
+export * from "./config.js";
+export * from "./constants.js";
+export * from "./handoff.js";
+export * from "./plan-store.js";
+export * from "./profile.js";
+export * from "./state.js";
+export * from "./tool-set.js";
+export * from "./types.js";
+
+const enterPlanSchema = Type.Object(
+  {
+    reason: Type.Optional(
+      Type.String({ description: "Optional short description of why a planning pass is appropriate." }),
+    ),
+  },
+  { additionalProperties: false },
+);
+
+const planWriteSchema = Type.Object(
+  {
+    content: Type.String({
+      minLength: 1,
+      description: "Complete replacement content for the canonical implementation plan Markdown file.",
+    }),
+    expected_revision: Type.Optional(
+      Type.Integer({
+        minimum: 1,
+        description: "Optional optimistic-concurrency check against the current plan revision.",
+      }),
+    ),
+  },
+  { additionalProperties: false },
+);
+
+const emptySchema = Type.Object({}, { additionalProperties: false });
+
+function formatStateSummary(state: PlanModeState | undefined): string {
+  if (!state || state.stage === "idle") return "Plan mode is inactive.";
+  const revision = state.plan ? ` r${state.plan.revision}` : "";
+  if (state.stage === "planning") return `Plan mode is active${revision}.`;
+  if (state.stage === "ready") return `Plan${revision} is ready for /plan-approve.`;
+  if (state.stage === "executing") return `Executing approved plan${revision}.`;
+  return `Plan${revision} was handed off to a new execution session.`;
+}
+
+function executionSessionName(state: PlanModeState): string {
+  const sourceName = state.source?.sourceSessionName?.trim();
+  if (sourceName) return `execute-${sourceName}`.slice(0, 80);
+  return `execute-plan-${state.plan?.id.slice(0, 8) ?? "session"}`;
+}
+
+function getCurrentBranch(ctx: ExtensionContext): Array<{ type: string; customType?: string; data?: unknown; details?: unknown; message?: unknown }> {
+  const manager = ctx.sessionManager as typeof ctx.sessionManager & {
+    getBranch?: () => Array<{ type: string; customType?: string; data?: unknown; details?: unknown; message?: unknown }>;
+  };
+  return typeof manager.getBranch === "function" ? manager.getBranch() : manager.getEntries();
+}
+
+function branchHasApprovedHandoff(ctx: ExtensionContext, current: PlanModeState): boolean {
+  if (!current.plan || !current.approved) return false;
+  return getCurrentBranch(ctx).some((entry) => {
+    if (entry.type !== "custom_message" || entry.customType !== PLAN_HANDOFF_MESSAGE) return false;
+    if (!entry.details || typeof entry.details !== "object") return false;
+    const details = entry.details as { planId?: unknown; revision?: unknown; hash?: unknown };
+    return (
+      details.planId === current.plan!.id &&
+      details.revision === current.approved!.revision &&
+      details.hash === current.approved!.hash
+    );
+  });
+}
+
+function countLatestAssistantToolCalls(ctx: ExtensionContext): number {
+  const branch = getCurrentBranch(ctx);
+  for (let index = branch.length - 1; index >= 0; index -= 1) {
+    const entry = branch[index] as { type?: string; message?: unknown } | undefined;
+    if (entry?.type !== "message" || !entry.message || typeof entry.message !== "object") continue;
+    const message = entry.message as { role?: string; content?: unknown };
+    if (message.role !== "assistant") continue;
+    if (!Array.isArray(message.content)) return 0;
+    return message.content.filter((block) => {
+      if (!block || typeof block !== "object") return false;
+      const type = (block as { type?: string }).type;
+      return type === "toolCall" || type === "tool_use";
+    }).length;
+  }
+  return 0;
+}
+
+export function registerClaudePlanMode(pi: ExtensionAPI): void {
+  let state: PlanModeState | undefined;
+  let pendingPlanningContinuation = false;
+
+  function allToolNames(): Set<string> {
+    return new Set(pi.getAllTools().map((tool) => tool.name));
+  }
+
+  function updateUi(ctx: ExtensionContext): void {
+    const current = state;
+    if (!current || current.stage === "idle" || current.stage === "handed_off") {
+      ctx.ui.setStatus(PLAN_STATUS_KEY, undefined);
+      ctx.ui.setWidget(PLAN_WIDGET_KEY, undefined);
+      return;
+    }
+
+    if (current.stage === "planning") {
+      const revision = current.plan?.revision ?? 0;
+      ctx.ui.setStatus(PLAN_STATUS_KEY, ctx.ui.theme.fg("warning", `plan:r${revision}`));
+      ctx.ui.setWidget(
+        PLAN_WIDGET_KEY,
+        [
+          ctx.ui.theme.fg("warning", `Plan Mode · revision ${revision}`),
+          ctx.ui.theme.fg("dim", current.plan?.path ?? "Plan file unavailable"),
+        ],
+        { placement: "aboveEditor" },
+      );
+      return;
+    }
+
+    if (current.stage === "ready") {
+      const revision = current.plan?.revision ?? 0;
+      ctx.ui.setStatus(PLAN_STATUS_KEY, ctx.ui.theme.fg("accent", `plan:ready r${revision}`));
+      ctx.ui.setWidget(
+        PLAN_WIDGET_KEY,
+        [
+          ctx.ui.theme.fg("accent", `Plan r${revision} is ready for approval`),
+          ctx.ui.theme.fg("muted", "Run /plan-approve to execute, edit, or continue planning."),
+        ],
+        { placement: "aboveEditor" },
+      );
+      return;
+    }
+
+    const revision = current.approved?.revision ?? current.plan?.revision ?? 0;
+    ctx.ui.setStatus(PLAN_STATUS_KEY, ctx.ui.theme.fg("success", `plan:executing r${revision}`));
+    ctx.ui.setWidget(
+      PLAN_WIDGET_KEY,
+      [ctx.ui.theme.fg("success", `Executing approved plan revision ${revision}`)],
+      { placement: "aboveEditor" },
+    );
+  }
+
+  function commitState(next: PlanModeState, ctx: ExtensionContext, persist = true): PlanModeState {
+    state = touchState(next);
+    if (persist) pi.appendEntry(PLAN_STATE_ENTRY, state);
+    updateUi(ctx);
+    return state;
+  }
+
+  function warnConfig(ctx: ExtensionContext, warnings: readonly string[]): void {
+    for (const warning of warnings) ctx.ui.notify(warning, "warning");
+  }
+
+  async function applyStateRuntime(current: PlanModeState, ctx: ExtensionContext): Promise<void> {
+    const names = allToolNames();
+    if ((current.stage === "planning" || current.stage === "ready") && current.baseline && current.planningProfile) {
+      const missing = getMissingPlanningTools(names);
+      if (missing.length > 0) {
+        throw new Error(
+          `Cannot restore Plan Mode because these tools are not registered: ${missing.join(", ")}. ` +
+            "Keep Pi's read/grep/find/ls tools registered (they may remain inactive outside Plan Mode).",
+        );
+      }
+      pi.setActiveTools(buildPlanningTools(names));
+      await applyProfile(pi, ctx, current.planningProfile, current.baseline.profile, "Planning profile");
+      return;
+    }
+
+    if (current.stage === "executing" && current.baseline && current.executionProfile) {
+      const tools = buildExecutionTools(current.executionTools ?? current.baseline.tools, names);
+      pi.setActiveTools(tools);
+      await applyProfile(pi, ctx, current.executionProfile, current.baseline.profile, "Execution profile");
+      return;
+    }
+
+    if (current.baseline) {
+      pi.setActiveTools(buildExecutionTools(current.baseline.tools, names));
+      await applyProfile(pi, ctx, current.baseline.profile, current.baseline.profile, "Baseline profile");
+      return;
+    }
+
+    pi.setActiveTools(buildIdleTools(pi.getActiveTools(), names));
+  }
+
+  async function restoreBranchRuntime(
+    ctx: ExtensionContext,
+    fallbackState?: PlanModeState,
+    recoverMissingHandoff = true,
+  ): Promise<void> {
+    state = restorePlanModeState(getCurrentBranch(ctx));
+    if (state?.plan && !isManagedPlanDocument(state.plan, getAgentDir())) {
+      ctx.ui.notify(
+        `Ignoring Plan state with an unmanaged canonical path: ${state.plan.path}`,
+        "error",
+      );
+      state = undefined;
+    }
+
+    if (state?.plan && (state.stage === "planning" || state.stage === "ready")) {
+      const ensured = await ensurePlanDocument(state.plan);
+      const refreshed = await refreshPlanDocument(ensured);
+      if (refreshed.changed || ensured !== state.plan) {
+        state = touchState({
+          ...state,
+          plan: refreshed.document,
+          stage: state.stage === "ready" ? "planning" : state.stage,
+          ready: state.stage === "ready" ? undefined : state.ready,
+          approved: undefined,
+        });
+        pi.appendEntry(PLAN_STATE_ENTRY, state);
+      }
+    }
+
+    try {
+      if (state) {
+        await applyStateRuntime(state, ctx);
+      } else if (fallbackState?.baseline) {
+        // Pi restores model/thinking entries while navigating the session tree,
+        // but active-tool changes are extension state. Remove Plan-only tools
+        // by restoring the baseline captured before Plan Mode. A rejected
+        // unsafe state may still provide the last known baseline tool snapshot.
+        const baseline = fallbackState.baseline;
+        pi.setActiveTools(buildExecutionTools(baseline.tools, allToolNames()));
+      } else {
+        pi.setActiveTools(buildIdleTools(pi.getActiveTools(), allToolNames()));
+      }
+    } catch (error) {
+      ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+    }
+
+    if (
+      recoverMissingHandoff &&
+      state?.stage === "executing" &&
+      state.approved &&
+      state.source &&
+      !branchHasApprovedHandoff(ctx, state)
+    ) {
+      // Recover the exact approved snapshot if Pi was interrupted after the
+      // execution state was persisted but before the handoff message landed.
+      pi.sendMessage(
+        {
+          customType: PLAN_HANDOFF_MESSAGE,
+          content: buildExecutionHandoffMessage(state),
+          display: true,
+          details: buildHandoffDetails(state, state.source.clearContext),
+        },
+        { triggerTurn: false },
+      );
+    }
+
+    updateUi(ctx);
+  }
+
+  async function synchronizePlan(ctx: ExtensionContext, invalidateReady = true): Promise<string> {
+    const current = state;
+    if (!current?.plan) throw new Error("No canonical plan is active.");
+    let document = await ensurePlanDocument(current.plan);
+    const refreshed = await refreshPlanDocument(document);
+    document = refreshed.document;
+    if (document !== current.plan || refreshed.changed) {
+      commitState(
+        {
+          ...current,
+          plan: document,
+          stage: invalidateReady && current.stage === "ready" ? "planning" : current.stage,
+          ready: invalidateReady && current.stage === "ready" ? undefined : current.ready,
+          approved: invalidateReady ? undefined : current.approved,
+        },
+        ctx,
+      );
+    }
+    return refreshed.content;
+  }
+
+  async function beginPlanning(
+    ctx: ExtensionContext,
+    options: { reason?: string; confirm: boolean },
+  ): Promise<{ entered: boolean; message: string }> {
+    if (state?.stage === "planning" || state?.stage === "ready") {
+      return { entered: false, message: formatStateSummary(state) };
+    }
+    if (state?.stage === "executing") {
+      return {
+        entered: false,
+        message: "An approved plan is currently in execution. Run /plan finish before starting another Plan session.",
+      };
+    }
+
+    if (options.confirm) {
+      if (!ctx.hasUI) {
+        return { entered: false, message: "Interactive Plan Mode confirmation is unavailable. Run /plan explicitly." };
+      }
+      const accepted = await ctx.ui.confirm(
+        "Enter Plan Mode?",
+        "Switch to Pi's structured read-only tools and create a canonical implementation plan?",
+      );
+      if (!accepted) return { entered: false, message: "The user declined Plan Mode." };
+    }
+
+    const names = allToolNames();
+    const missing = getMissingPlanningTools(names);
+    if (missing.length > 0) {
+      const message =
+        `Plan Mode cannot start because these tools are unavailable: ${missing.join(", ")}. ` +
+        "Do not launch Pi with --no-builtin-tools or a strict --tools list that removes read/grep/find/ls, " +
+        "and do not permanently disable those four tools.";
+      ctx.ui.notify(message, "error");
+      return { entered: false, message };
+    }
+
+    const baselineTools = buildIdleTools(pi.getActiveTools(), names);
+    const baselineProfile = captureCurrentProfile(pi, ctx);
+    const loaded = loadPlanModeConfig(ctx.cwd, {
+      agentDir: getAgentDir(),
+      configDirName: CONFIG_DIR_NAME,
+      loadProjectConfig: ctx.isProjectTrusted(),
+    });
+    warnConfig(ctx, loaded.warnings);
+    const planningProfile = resolvePhaseProfile(baselineProfile, loaded.config.planning);
+    const executionProfile = resolvePhaseProfile(baselineProfile, loaded.config.execution);
+    const plan = await createPlanDocument(getAgentDir(), options.reason);
+
+    const next = commitState(
+      {
+        schemaVersion: STATE_SCHEMA_VERSION,
+        stage: "planning",
+        plan,
+        baseline: { profile: baselineProfile, tools: baselineTools },
+        planningProfile,
+        executionProfile,
+        executionTools: baselineTools,
+        updatedAt: new Date().toISOString(),
+      },
+      ctx,
+    );
+
+    pi.setActiveTools(buildPlanningTools(names));
+    await applyProfile(pi, ctx, planningProfile, baselineProfile, "Planning profile");
+    updateUi(ctx);
+    return {
+      entered: true,
+      message: `Plan Mode enabled. Canonical plan: ${next.plan?.path} (revision ${next.plan?.revision}).`,
+    };
+  }
+
+  async function leaveCurrentPlan(ctx: ExtensionContext): Promise<void> {
+    const current = state;
+    if (!current?.baseline) {
+      state = undefined;
+      pi.setActiveTools(buildIdleTools(pi.getActiveTools(), allToolNames()));
+      updateUi(ctx);
+      return;
+    }
+    const next = commitState(
+      {
+        ...current,
+        stage: "idle",
+        ready: undefined,
+        approved: undefined,
+        source: undefined,
+      },
+      ctx,
+    );
+    pi.setActiveTools(buildExecutionTools(next.baseline!.tools, allToolNames()));
+    await applyProfile(pi, ctx, next.baseline!.profile, next.baseline!.profile, "Baseline profile");
+    updateUi(ctx);
+  }
+
+  async function editCanonicalPlan(
+    ctx: ExtensionContext,
+    options: { preserveReady?: boolean } = {},
+  ): Promise<{ changed: boolean; ready: boolean }> {
+    if (!state?.plan || (state.stage !== "planning" && state.stage !== "ready")) {
+      ctx.ui.notify("There is no editable Plan session.", "warning");
+      return { changed: false, ready: false };
+    }
+
+    const content = await synchronizePlan(ctx, !options.preserveReady);
+    const current = state!;
+    const edited = await ctx.ui.editor(`Edit plan r${current.plan!.revision}`, content);
+    if (edited === undefined || edited === content) {
+      return { changed: false, ready: current.stage === "ready" };
+    }
+
+    const normalized = edited.endsWith("\n") ? edited : `${edited}\n`;
+    const plan = await updatePlanDocument(current.plan!, normalized);
+    const readiness = isPlanReady(normalized);
+    const preserveReady = options.preserveReady === true && readiness.ready;
+    const ready = preserveReady
+      ? {
+          revision: plan.revision,
+          hash: plan.hash,
+          preparedAt: new Date().toISOString(),
+        }
+      : undefined;
+
+    commitState(
+      {
+        ...current,
+        stage: preserveReady ? "ready" : "planning",
+        plan,
+        ready,
+        approved: undefined,
+      },
+      ctx,
+    );
+
+    if (preserveReady) {
+      ctx.ui.notify(`Plan updated to revision ${plan.revision} and remains ready for approval.`, "info");
+    } else if (readiness.ready) {
+      ctx.ui.notify(`Plan updated to revision ${plan.revision}. Call ${EXIT_PLAN_MODE_TOOL} when ready.`, "info");
+    } else {
+      ctx.ui.notify(
+        `Plan updated to revision ${plan.revision}, but it is not ready: ${readiness.reason}`,
+        "warning",
+      );
+    }
+    return { changed: true, ready: preserveReady };
+  }
+
+  async function continueWithFeedback(ctx: ExtensionContext): Promise<void> {
+    if (!state?.plan || (state.stage !== "planning" && state.stage !== "ready")) {
+      ctx.ui.notify("There is no Plan session awaiting feedback.", "warning");
+      return;
+    }
+    const feedback = await ctx.ui.editor("Feedback for the plan", "");
+    if (!feedback?.trim()) return;
+    const next = commitState(
+      {
+        ...state,
+        stage: "planning",
+        ready: undefined,
+        approved: undefined,
+        lastFeedback: feedback.trim(),
+      },
+      ctx,
+    );
+    pi.sendUserMessage(
+      `Revise the canonical plan at ${next.plan!.path} using this user feedback:\n\n${feedback.trim()}\n\n` +
+        `Update the plan with ${PLAN_WRITE_TOOL}, then call ${EXIT_PLAN_MODE_TOOL} again when it is ready.`,
+    );
+  }
+
+  async function approveKeepContext(ctx: ExtensionCommandContext, content: string): Promise<void> {
+    if (!state?.plan || !state.baseline || !state.executionProfile) throw new Error("Plan state is incomplete.");
+    const source = {
+      sourceSessionId: ctx.sessionManager.getSessionId(),
+      sourceSessionFile: ctx.sessionManager.getSessionFile(),
+      sourceSessionName: pi.getSessionName(),
+      clearContext: false,
+    };
+    const { state: approvedState } = approvePlan(state, content);
+    const executionState = buildExecutionState(approvedState, source);
+    commitState(executionState, ctx);
+    pi.setActiveTools(
+      buildExecutionTools(executionState.executionTools ?? executionState.baseline!.tools, allToolNames()),
+    );
+    await applyProfile(
+      pi,
+      ctx,
+      executionState.executionProfile!,
+      executionState.baseline!.profile,
+      "Execution profile",
+    );
+    updateUi(ctx);
+    pi.sendMessage(
+      {
+        customType: PLAN_HANDOFF_MESSAGE,
+        content: buildExecutionHandoffMessage(executionState),
+        display: true,
+        details: buildHandoffDetails(executionState, false),
+      },
+      { triggerTurn: true },
+    );
+  }
+
+  async function approveFreshSession(ctx: ExtensionCommandContext, content: string): Promise<void> {
+    if (!state?.plan || !state.baseline || !state.executionProfile) throw new Error("Plan state is incomplete.");
+    const source = {
+      sourceSessionId: ctx.sessionManager.getSessionId(),
+      sourceSessionFile: ctx.sessionManager.getSessionFile(),
+      sourceSessionName: pi.getSessionName(),
+      clearContext: true,
+    };
+    const { state: approvedState, approved } = approvePlan(state, content);
+    const executionState = buildExecutionState(approvedState, source);
+    const handoffMessage = buildExecutionHandoffMessage(executionState);
+    const handoffDetails = buildHandoffDetails(executionState, true);
+    const readyBeforeHandoff: ReadyPlanSnapshot = {
+      revision: approved.revision,
+      hash: approved.hash,
+      preparedAt: new Date().toISOString(),
+    };
+
+    commitState(
+      {
+        ...approvedState,
+        stage: "handed_off",
+        source,
+      },
+      ctx,
+    );
+
+    const result = await ctx.newSession({
+      ...(source.sourceSessionFile ? { parentSession: source.sourceSessionFile } : {}),
+      setup: async (sessionManager) => {
+        sessionManager.appendCustomEntry(PLAN_STATE_ENTRY, executionState);
+        sessionManager.appendSessionInfo(executionSessionName(executionState));
+      },
+      withSession: async (newContext) => {
+        await newContext.sendMessage(
+          {
+            customType: PLAN_HANDOFF_MESSAGE,
+            content: handoffMessage,
+            display: true,
+            details: handoffDetails,
+          },
+          { triggerTurn: true },
+        );
+      },
+    });
+
+    if (!result.cancelled) return;
+
+    commitState(
+      {
+        ...approvedState,
+        stage: "ready",
+        approved: undefined,
+        source: undefined,
+        ready: readyBeforeHandoff,
+      },
+      ctx,
+    );
+    ctx.ui.notify("Creating the execution session was cancelled; the plan remains ready for approval.", "warning");
+  }
+
+  async function loadReadyPlan(
+    ctx: ExtensionCommandContext,
+  ): Promise<{ current: PlanModeState; content: string } | undefined> {
+    if (state?.stage !== "ready" || !state.plan || !state.ready) {
+      ctx.ui.notify("No plan is ready. Complete planning and call ExitPlanMode first.", "warning");
+      return undefined;
+    }
+
+    const content = await synchronizePlan(ctx, false);
+    const current = state;
+    if (
+      current?.stage !== "ready" ||
+      !current.plan ||
+      !current.ready ||
+      current.ready.hash !== current.plan.hash ||
+      current.ready.revision !== current.plan.revision
+    ) {
+      if (current?.stage === "ready") {
+        commitState({ ...current, stage: "planning", ready: undefined, approved: undefined }, ctx);
+      }
+      ctx.ui.notify("The plan changed after ExitPlanMode. Review it and call ExitPlanMode again.", "warning");
+      return undefined;
+    }
+
+    const readiness = isPlanReady(content);
+    if (!readiness.ready) {
+      commitState({ ...current, stage: "planning", ready: undefined, approved: undefined }, ctx);
+      ctx.ui.notify(`The plan is no longer ready: ${readiness.reason}`, "warning");
+      return undefined;
+    }
+    return { current, content };
+  }
+
+  async function runApprovalCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
+    await ctx.waitForIdle();
+    let requestedAction = args.trim().toLowerCase();
+
+    while (true) {
+      const loaded = await loadReadyPlan(ctx);
+      if (!loaded) return;
+      const current = loaded.current;
+      let action = requestedAction;
+      requestedAction = "";
+
+      if (!action) {
+        if (!ctx.hasUI) {
+          ctx.ui.notify("Use /plan-approve keep or /plan-approve clear in non-interactive mode.", "warning");
+          return;
+        }
+        const choice = await ctx.ui.select(`Plan r${current.plan!.revision} · ${current.plan!.path}`, [
+          "Execute plan (keep context)",
+          "Clear context and execute in a new session",
+          "Edit plan",
+          "Give feedback and continue planning",
+          "Stay in Plan Mode",
+        ]);
+        if (!choice) return;
+        action = choice.startsWith("Execute")
+          ? "keep"
+          : choice.startsWith("Clear")
+            ? "clear"
+            : choice.startsWith("Edit")
+              ? "edit"
+              : choice.startsWith("Give")
+                ? "feedback"
+                : "stay";
+      }
+
+      if (["keep", "execute", "same"].includes(action)) {
+        const latest = await loadReadyPlan(ctx);
+        if (latest) await approveKeepContext(ctx, latest.content);
+        return;
+      }
+      if (["clear", "fresh", "new"].includes(action)) {
+        const latest = await loadReadyPlan(ctx);
+        if (latest) await approveFreshSession(ctx, latest.content);
+        return;
+      }
+      if (action === "edit") {
+        const result = await editCanonicalPlan(ctx, { preserveReady: true });
+        if (!result.ready || args.trim()) return;
+        continue;
+      }
+      if (["feedback", "revise"].includes(action)) {
+        await continueWithFeedback(ctx);
+        return;
+      }
+      if (["stay", "cancel"].includes(action)) {
+        commitState({ ...current, stage: "planning", ready: undefined, approved: undefined }, ctx);
+        ctx.ui.notify("Remaining in Plan Mode.", "info");
+        return;
+      }
+      ctx.ui.notify("Unknown approval action. Use keep, clear, edit, feedback, or stay.", "warning");
+      return;
+    }
+  }
+
+  pi.registerFlag("plan", {
+    description: "Start the session in Claude-style Plan Mode",
+    type: "boolean",
+    default: false,
+  });
+
+  pi.registerTool({
+    name: ENTER_PLAN_MODE_TOOL,
+    label: "Enter Plan Mode",
+    description:
+      "Ask the user to enter a read-only planning workflow before implementing a non-trivial task. The Plan session uses read, grep, find, and ls plus a canonical plan file.",
+    promptSnippet: "Enter a read-only planning workflow before complex implementation work",
+    promptGuidelines: [
+      "Use EnterPlanMode for non-trivial features, multi-file changes, architecture decisions, or when the user asks for a plan first.",
+      "Call EnterPlanMode alone in its tool-call turn.",
+      "Do not use it for tiny, obvious changes that can be implemented safely without exploration.",
+    ],
+    parameters: enterPlanSchema,
+    executionMode: "sequential",
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const result = await beginPlanning(ctx, { reason: params.reason, confirm: true });
+      if (result.entered) pendingPlanningContinuation = true;
+      return {
+        content: [{ type: "text", text: result.message }],
+        details: { entered: result.entered, plan: state?.plan },
+        terminate: result.entered || undefined,
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: PLAN_WRITE_TOOL,
+    label: "Write Plan",
+    description:
+      "Replace the complete canonical Plan Mode Markdown document. This tool has no path parameter and cannot modify project files.",
+    promptSnippet: "Write the canonical implementation plan document",
+    promptGuidelines: [
+      "Use plan_write only in Plan Mode.",
+      "Pass the complete plan, not a patch or fragment.",
+      "Remove all initial template placeholders before requesting approval.",
+    ],
+    parameters: planWriteSchema,
+    executionMode: "sequential",
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (!state?.plan || (state.stage !== "planning" && state.stage !== "ready")) {
+        throw new Error("plan_write is only available during an active Plan session.");
+      }
+      const plan = await updatePlanDocument(state.plan, params.content, params.expected_revision);
+      const next = commitState(
+        {
+          ...state,
+          stage: "planning",
+          plan,
+          ready: undefined,
+          approved: undefined,
+        },
+        ctx,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Canonical plan updated to revision ${plan.revision}.\nPath: ${plan.path}\nSHA-256: ${plan.hash}`,
+          },
+        ],
+        details: { plan: next.plan },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: EXIT_PLAN_MODE_TOOL,
+    label: "Exit Plan Mode",
+    description:
+      "Mark the canonical plan ready for user approval. This ends the planning agent run; the user then runs /plan-approve.",
+    promptSnippet: "Finish planning and ask the user to review the canonical plan",
+    promptGuidelines: [
+      "Call ExitPlanMode only after the canonical plan is complete.",
+      "Call ExitPlanMode alone in its tool-call turn.",
+      "Do not begin implementation after calling it.",
+    ],
+    parameters: emptySchema,
+    executionMode: "sequential",
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      if (!state?.plan || (state.stage !== "planning" && state.stage !== "ready")) {
+        throw new Error("ExitPlanMode is only available during an active Plan session.");
+      }
+      const content = await synchronizePlan(ctx, false);
+      const current = state!;
+      const readiness = isPlanReady(content);
+      if (!readiness.ready) throw new Error(`Plan is not ready: ${readiness.reason}`);
+
+      const ready: ReadyPlanSnapshot = {
+        revision: current.plan!.revision,
+        hash: current.plan!.hash,
+        preparedAt: new Date().toISOString(),
+      };
+      commitState({ ...current, stage: "ready", ready, approved: undefined }, ctx);
+      if (ctx.hasUI && !ctx.ui.getEditorText().trim()) ctx.ui.setEditorText("/plan-approve");
+      ctx.ui.notify("Plan is ready. Review it and run /plan-approve.", "info");
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Planning is complete. The user must run /plan-approve before implementation.\n\n` +
+              `## Plan revision ${ready.revision}\n\n${content}`,
+          },
+        ],
+        details: { plan: current.plan, ready },
+        terminate: true,
+      };
+    },
+  });
+
+  pi.registerCommand("plan", {
+    description: "Start, inspect, edit, cancel, or finish Claude-style Plan Mode",
+    handler: async (args, ctx) => {
+      const raw = args.trim();
+      if (!raw) {
+        if (!state || state.stage === "idle" || state.stage === "handed_off") {
+          const result = await beginPlanning(ctx, { confirm: false });
+          ctx.ui.notify(result.message, result.entered ? "info" : "warning");
+        } else {
+          ctx.ui.notify(formatStateSummary(state), "info");
+        }
+        return;
+      }
+
+      const [command = "", ...rest] = raw.split(/\s+/);
+      const normalized = command.toLowerCase();
+      const task = rest.join(" ").trim();
+
+      if (normalized === "status") {
+        ctx.ui.notify(formatStateSummary(state), "info");
+        return;
+      }
+      if (["on", "start"].includes(normalized)) {
+        const result = await beginPlanning(ctx, { reason: task || undefined, confirm: false });
+        ctx.ui.notify(result.message, result.entered ? "info" : "warning");
+        if (result.entered && task) pi.sendUserMessage(task, { expandPromptTemplates: true });
+        return;
+      }
+      if (["off", "cancel"].includes(normalized)) {
+        await leaveCurrentPlan(ctx);
+        ctx.ui.notify("Plan workflow ended and the pre-Plan profile was restored.", "info");
+        return;
+      }
+      if (normalized === "finish") {
+        if (state?.stage !== "executing") {
+          ctx.ui.notify("No approved plan is currently executing.", "warning");
+          return;
+        }
+        await leaveCurrentPlan(ctx);
+        ctx.ui.notify("Execution profile ended and the pre-Plan profile was restored.", "info");
+        return;
+      }
+      if (normalized === "edit") {
+        await editCanonicalPlan(ctx);
+        return;
+      }
+      if (normalized === "path") {
+        ctx.ui.notify(state?.plan?.path ?? "No canonical plan is active.", "info");
+        return;
+      }
+      if (normalized === "config") {
+        const loaded = loadPlanModeConfig(ctx.cwd, {
+          agentDir: getAgentDir(),
+          configDirName: CONFIG_DIR_NAME,
+          loadProjectConfig: ctx.isProjectTrusted(),
+        });
+        warnConfig(ctx, loaded.warnings);
+        ctx.ui.notify(`Global: ${loaded.globalPath}\nProject: ${loaded.projectPath}`, "info");
+        return;
+      }
+      if (normalized === "approve") {
+        await runApprovalCommand(task, ctx);
+        return;
+      }
+
+      // Treat any unrecognized text as the planning task itself. This makes
+      // `/plan add prompt history` enter Plan Mode and immediately start the turn.
+      if (state?.stage === "ready") {
+        commitState(
+          {
+            ...state,
+            stage: "planning",
+            ready: undefined,
+            approved: undefined,
+            lastFeedback: raw,
+          },
+          ctx,
+        );
+      }
+      if (!state || state.stage === "idle" || state.stage === "handed_off") {
+        const result = await beginPlanning(ctx, { reason: raw, confirm: false });
+        if (!result.entered) {
+          ctx.ui.notify(result.message, "warning");
+          return;
+        }
+      }
+      if (state?.stage !== "planning") {
+        ctx.ui.notify(formatStateSummary(state), "warning");
+        return;
+      }
+      pi.sendUserMessage(raw, { expandPromptTemplates: true });
+    },
+  });
+
+  pi.registerCommand("plan-approve", {
+    description: "Review a ready plan and execute it in the current or a fresh child session",
+    handler: runApprovalCommand,
+  });
+
+  pi.on("session_start", async (event, ctx) => {
+    await restoreBranchRuntime(ctx, undefined, event.reason !== "new");
+    if (pi.getFlag("plan") === true && (!state || state.stage === "idle" || state.stage === "handed_off")) {
+      const result = await beginPlanning(ctx, { reason: "Started with --plan", confirm: false });
+      if (!result.entered) ctx.ui.notify(result.message, "warning");
+    }
+  });
+
+  pi.on("session_shutdown", (_event, ctx) => {
+    pendingPlanningContinuation = false;
+    ctx.ui.setStatus(PLAN_STATUS_KEY, undefined);
+    ctx.ui.setWidget(PLAN_WIDGET_KEY, undefined);
+  });
+
+  pi.on("agent_settled", (_event, ctx) => {
+    if (!pendingPlanningContinuation) return;
+    pendingPlanningContinuation = false;
+    if (state?.stage !== "planning" || !state.plan || ctx.hasPendingMessages()) return;
+    pi.sendMessage(
+      {
+        customType: PLAN_CONTINUE_MESSAGE,
+        content:
+          `Continue planning the user's request in Plan Mode. Explore the repository with read, grep, find, and ls. ` +
+          `Maintain the canonical plan at ${state.plan.path} with ${PLAN_WRITE_TOOL}, and call ${EXIT_PLAN_MODE_TOOL} ` +
+          "alone when the plan is complete.",
+        display: false,
+        details: { planId: state.plan.id, revision: state.plan.revision },
+      },
+      { triggerTurn: true },
+    );
+  });
+
+  pi.on("session_tree", async (_event, ctx) => {
+    const previousState = state;
+    await restoreBranchRuntime(ctx, previousState);
+  });
+
+  pi.on("before_agent_start", (event, _ctx) => {
+    if (!state) return;
+    const names = allToolNames();
+    const modePrompt =
+      state.stage === "planning"
+        ? buildPlanningSystemPrompt(state, names.has(ASK_USER_QUESTION_TOOL))
+        : state.stage === "ready"
+          ? buildReadySystemPrompt(state)
+          : state.stage === "executing"
+            ? buildExecutionSystemPrompt(state)
+            : "";
+    if (!modePrompt) return;
+    return { systemPrompt: `${event.systemPrompt}\n\n${modePrompt}` };
+  });
+
+  pi.on("input", (event, ctx) => {
+    if (state?.stage !== "ready") return;
+    if (event.text.trim().startsWith("/")) return;
+    commitState(
+      {
+        ...state,
+        stage: "planning",
+        ready: undefined,
+        approved: undefined,
+        lastFeedback: event.text.trim() || undefined,
+      },
+      ctx,
+    );
+    ctx.ui.notify("User feedback reopened Plan Mode. Revise the plan and call ExitPlanMode again.", "info");
+  });
+
+  pi.on("tool_call", (event, ctx) => {
+    if (
+      (event.toolName === ENTER_PLAN_MODE_TOOL || event.toolName === EXIT_PLAN_MODE_TOOL) &&
+      countLatestAssistantToolCalls(ctx) > 1
+    ) {
+      return {
+        block: true,
+        reason: `${event.toolName} must be called alone in its tool-call turn.`,
+      };
+    }
+
+    if (state?.stage !== "planning" && state?.stage !== "ready") return;
+    const names = allToolNames();
+    if (isPlanningToolAllowed(event.toolName, names)) return;
+    return {
+      block: true,
+      reason:
+        `Plan Mode blocks ${event.toolName}. Use read, grep, find, ls, ${PLAN_WRITE_TOOL}, ` +
+        `${ASK_USER_QUESTION_TOOL} (when installed), or ${EXIT_PLAN_MODE_TOOL}.`,
+    };
+  });
+
+  pi.on("model_select", (event, ctx) => {
+    if (!state) return;
+    if (state.stage === "planning" || state.stage === "ready") {
+      commitState(
+        {
+          ...state,
+          planningProfile: {
+            ...(state.planningProfile ?? captureCurrentProfile(pi, ctx)),
+            provider: event.model.provider,
+            model: event.model.id,
+          },
+        },
+        ctx,
+      );
+    } else if (state.stage === "executing") {
+      commitState(
+        {
+          ...state,
+          executionProfile: {
+            ...(state.executionProfile ?? captureCurrentProfile(pi, ctx)),
+            provider: event.model.provider,
+            model: event.model.id,
+          },
+        },
+        ctx,
+      );
+    }
+  });
+
+  pi.on("thinking_level_select", (event, ctx) => {
+    if (!state) return;
+    if (state.stage === "planning" || state.stage === "ready") {
+      commitState(
+        {
+          ...state,
+          planningProfile: {
+            ...(state.planningProfile ?? captureCurrentProfile(pi, ctx)),
+            thinkingLevel: event.level,
+          },
+        },
+        ctx,
+      );
+    } else if (state.stage === "executing") {
+      commitState(
+        {
+          ...state,
+          executionProfile: {
+            ...(state.executionProfile ?? captureCurrentProfile(pi, ctx)),
+            thinkingLevel: event.level,
+          },
+        },
+        ctx,
+      );
+    }
+  });
+
+}
+
+export default function claudePlanModeExtension(pi: ExtensionAPI): void {
+  registerClaudePlanMode(pi);
+}

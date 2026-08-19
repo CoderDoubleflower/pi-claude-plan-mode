@@ -1,0 +1,11 @@
+import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+export * from "./config.js";
+export * from "./constants.js";
+export * from "./handoff.js";
+export * from "./plan-store.js";
+export * from "./profile.js";
+export * from "./state.js";
+export * from "./tool-set.js";
+export * from "./types.js";
+export declare function registerClaudePlanMode(pi: ExtensionAPI): void;
+export default function claudePlanModeExtension(pi: ExtensionAPI): void;

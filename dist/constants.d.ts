@@ -1,0 +1,12 @@
+export declare const ENTER_PLAN_MODE_TOOL = "EnterPlanMode";
+export declare const EXIT_PLAN_MODE_TOOL = "ExitPlanMode";
+export declare const PLAN_WRITE_TOOL = "plan_write";
+export declare const ASK_USER_QUESTION_TOOL = "ask_user_question";
+export declare const READ_ONLY_PLAN_TOOLS: readonly ["read", "grep", "find", "ls"];
+export declare const PLAN_STATE_ENTRY = "claude-plan-mode-state";
+export declare const PLAN_HANDOFF_MESSAGE = "claude-plan-mode-handoff";
+export declare const PLAN_CONTINUE_MESSAGE = "claude-plan-mode-continuation";
+export declare const PLAN_STATUS_KEY = "claude-plan-mode";
+export declare const PLAN_WIDGET_KEY = "claude-plan-mode";
+export declare const PLAN_TEMPLATE_MARKER = "<!-- pi-claude-plan-mode:template -->";
+export declare const STATE_SCHEMA_VERSION = 1;

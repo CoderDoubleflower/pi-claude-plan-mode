@@ -1,0 +1,351 @@
+# pi-claude-plan-mode
+
+在 Pi 中复刻 Claude Code 风格的 Plan Mode：先用结构化只读工具探索代码库，把方案写入独立的 canonical plan 文件，显式交给用户审批，再选择保留上下文执行，或清空上下文并创建一个新的 execution session。
+
+本插件面向 Pi `0.84.2+`，尤其适合常规工作流只启用以下两个工具的环境：
+
+- `shell_command`
+- `apply_patch`
+
+进入 Plan Mode 后不会尝试分析或限制任意 Shell 命令，而是临时切换到 Pi 官方的结构化只读工具。
+
+## 核心行为
+
+普通阶段通常保留用户当前的工具，例如：
+
+```text
+shell_command
+apply_patch
+EnterPlanMode
+ask_user_question（若已安装）
+```
+
+Plan Mode 中只暴露：
+
+```text
+read
+grep
+find
+ls
+plan_write
+ExitPlanMode
+ask_user_question（若已安装）
+```
+
+其中：
+
+- `shell_command` 在 Plan Mode 中不可见；
+- `apply_patch` 在 Plan Mode 中不可见；
+- `plan_write` 没有路径参数，只能完整替换当前 canonical plan 文件；
+- 其他未知或后来注册的工具在 Plan Mode 中默认阻断；
+- `EnterPlanMode` 与 `ExitPlanMode` 必须单独出现在一个 tool-call turn 中。
+
+Plan 文件默认保存到：
+
+```text
+~/.pi/agent/plans/<uuid>.md
+```
+
+如果设置了 `PI_CODING_AGENT_DIR`，则遵循 Pi 的 agent directory。
+
+## 安装
+
+从 GitHub 全局安装：
+
+```bash
+pi install git:github.com/CoderDoubleflower/pi-claude-plan-mode
+```
+
+项目级安装：
+
+```bash
+pi install -l git:github.com/CoderDoubleflower/pi-claude-plan-mode
+```
+
+安装或升级后重启 Pi，或执行：
+
+```text
+/reload
+```
+
+## 前置条件
+
+Plan Mode 需要以下 Pi 内置工具仍然存在于运行时工具注册表：
+
+```text
+read
+grep
+find
+ls
+```
+
+它们可以在普通模式下保持 inactive，但不能被从注册表彻底排除。因此不要使用会删除这些工具的启动方式，例如：
+
+```text
+--no-builtin-tools
+--tools shell_command,apply_patch
+```
+
+也不要在工具管理插件中把 `read/grep/find/ls` 设为永久禁用。推荐做法是：普通模式只让它们 inactive，Plan Mode 进入时由本插件临时激活。
+
+## 使用方式
+
+### 用户主动进入
+
+```text
+/plan
+```
+
+也可以直接附带任务并立即开始规划：
+
+```text
+/plan 为编辑框增加上下方向键历史记录
+```
+
+等价的显式形式：
+
+```text
+/plan on 为编辑框增加上下方向键历史记录
+```
+
+### 模型主动进入
+
+插件注册 `EnterPlanMode`。模型遇到多文件功能、架构调整或需要先探索的任务时，可以请求进入 Plan Mode；TUI 会要求用户确认。确认后，当前 agent run 会以 terminating tool result 正常结束，插件再自动发起一个隐藏的 planning continuation，使下一次模型调用从一开始就只看到 `read/grep/find/ls` 和 Plan workflow 工具。
+
+### 规划完成
+
+模型必须：
+
+1. 用 `read/grep/find/ls` 探索代码；
+2. 用 `plan_write` 写入完整计划；
+3. 单独调用 `ExitPlanMode`。
+
+`ExitPlanMode` 会结束当前 planning run，把完整计划展示出来，并把以下命令放入空闲编辑框：
+
+```text
+/plan-approve
+```
+
+本插件仅使用 stock Pi 的公开扩展 API，不尝试给 Pi 打补丁，也不检测或启用任何隐藏的新 session API。因此审批与 session 切换正式由 `/plan-approve` 完成。
+
+## `/plan-approve`
+
+无参数调用会显示以下选项：
+
+```text
+Execute plan (keep context)
+Clear context and execute in a new session
+Edit plan
+Give feedback and continue planning
+Stay in Plan Mode
+```
+
+也可以直接指定：
+
+```text
+/plan-approve keep
+/plan-approve clear
+/plan-approve edit
+/plan-approve feedback
+/plan-approve stay
+```
+
+### Keep context
+
+在原 Plan session 内：
+
+1. 固化 approved plan 的 revision、SHA-256 和完整正文；
+2. 恢复进入 Plan Mode 前的工具集；
+3. 应用 execution 模型和思考强度；
+4. 注入 approved plan handoff；
+5. 自动开始实现。
+
+### Clear context
+
+创建真正的新 execution session，而不是在原 session 中过滤消息：
+
+```text
+Planning session S1
+        │
+        ├─ 保存 approved plan snapshot
+        ├─ 标记为 handed_off
+        │
+        ▼
+Execution session S2
+        ├─ parentSession = S1 transcript
+        ├─ 新 session ID 与 transcript
+        ├─ setup 写入 execution state 与 session name
+        ├─ 只注入 approved plan handoff
+        ├─ 应用 execution profile
+        ├─ 恢复 execution 工具
+        └─ 自动开始实现
+```
+
+S2 的 handoff 中会包含：
+
+- approved plan 全文；
+- revision；
+- SHA-256；
+- canonical plan 路径；
+- planning session ID；
+- planning transcript 路径。
+
+如果创建新 session 被其他扩展取消，原 Plan session 会恢复为 ready 状态，不会丢失计划。
+
+## 模型和思考强度配置
+
+全局配置：
+
+```text
+~/.pi/agent/claude-plan-mode.json
+```
+
+项目配置：
+
+```text
+<project>/.pi/claude-plan-mode.json
+```
+
+项目配置按字段覆盖全局配置。项目尚未被 Pi 信任时，插件只读取全局配置，不读取项目目录中的配置文件。
+
+示例：
+
+```json
+{
+  "planning": {
+    "provider": "openai-codex",
+    "model": "gpt-5.2-codex",
+    "thinkingLevel": "xhigh"
+  },
+  "execution": {
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-5",
+    "thinkingLevel": "high"
+  }
+}
+```
+
+也可以只配置思考强度：
+
+```json
+{
+  "planning": {
+    "thinkingLevel": "xhigh"
+  },
+  "execution": {
+    "thinkingLevel": "high"
+  }
+}
+```
+
+支持的思考强度：
+
+```text
+off
+minimal
+low
+medium
+high
+xhigh
+max
+```
+
+`provider` 和 `model` 必须成对配置。只配置其中一个时，这两个字段会被忽略并显示 warning。
+
+### 回退语义
+
+进入 Plan Mode 前会保存 baseline profile：
+
+```text
+当前 provider/model
+当前 thinking level
+当前 active tools
+```
+
+随后：
+
+- planning 未配置的字段回退到 baseline；
+- execution 未配置的字段也回退到 baseline；
+- execution 不会意外继承 planning 专属模型；
+- 目标模型不存在或无凭据时，回退到 baseline 并显示 warning；
+- 用户在 planning/execution 阶段手动切换模型或思考强度后，新的阶段 profile 会写入 session state，resume 时继续使用。
+
+## 命令
+
+```text
+/plan                         进入 Plan Mode，或显示当前状态
+/plan <task>                  进入 Plan Mode 并立即提交规划任务
+/plan on [task]               显式进入 Plan Mode
+/plan status                  查看状态
+/plan edit                    编辑 canonical plan
+/plan path                    显示 plan 文件路径
+/plan approve [action]        /plan-approve 的别名
+/plan off                     取消 Plan workflow 并恢复 baseline
+/plan finish                  结束 execution profile 并恢复 baseline
+/plan config                  显示全局和项目配置路径
+/plan-approve [action]        审批 ready plan
+```
+
+也可用启动参数让初始 session 直接进入 Plan Mode：
+
+```bash
+pi --plan
+```
+
+## Session 持久化
+
+插件通过 custom session entry 保存：
+
+- workflow stage；
+- plan 文件、revision 和 hash；
+- baseline profile 和工具快照；
+- planning/execution profile；
+- ready/approved snapshot；
+- planning session 与 execution session 的来源关系。
+
+恢复 session 或切换 branch 时，插件从当前 branch 的最新有效状态重建工具、模型、思考强度和 UI。
+
+## Plan 一致性
+
+- `plan_write` 支持 `expected_revision`，用于乐观并发检查；
+- 外部编辑 Plan 文件会被检测，并自动生成新 revision；
+- `ExitPlanMode` 后如果 Plan 文件发生变化，旧 ready snapshot 立即失效；
+- execution handoff 使用审批时固化的完整正文，不会在执行时重新读取一个可能已变化的 draft；
+- session 恢复时只接受与 `<agentDir>/plans/<plan-id>.md` 精确匹配的 managed Plan 路径；
+- Plan 目录和文件拒绝符号链接替换，原子写入使用私有临时文件；
+- 初始模板必须被完整替换，且计划需要包含 `## Implementation Steps` 和编号步骤才能进入审批。
+
+## 开发
+
+```bash
+npm install
+npm run typecheck
+npm test
+```
+
+测试覆盖：
+
+- 全局/项目配置合并；
+- 模型配置回退；
+- Plan revision 与外部修改检测；
+- stale write 拒绝；
+- 状态恢复；
+- Plan 工具集边界；
+- approved snapshot handoff；
+- `/plan-approve clear` 通过 stock Pi `newSession({ setup, withSession })` 创建 child session；
+- 模型主动调用 `EnterPlanMode` 后的 terminating continuation；
+- session replacement 取消后的 ready-state 恢复；
+- keep-context execution 与 `/plan finish` baseline 恢复；
+- session tree 工具状态恢复；
+- handoff 中断后的 approved snapshot 重建。
+
+## 安全边界
+
+Plan Mode 的主要不变量是：
+
+```text
+项目探索只能使用结构化 read/grep/find/ls
+唯一写入能力是无路径参数的 plan_write
+```
+
+工具切换本身不是操作系统沙箱；Pi extension 仍运行在当前用户权限下。但与对任意 `shell_command` 做正则或 AST 判定相比，这个设计不会因 Shell 语义产生大量误伤，也不会把未知写命令误判为只读。插件不会注册额外的 Git 查询工具；Plan 阶段的仓库探索范围就是 `read/grep/find/ls`。
