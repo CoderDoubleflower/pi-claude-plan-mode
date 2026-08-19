@@ -116,9 +116,33 @@ ls
 
 模型必须：
 
-1. 用 `read/grep/find/ls` 探索代码；
-2. 用 `plan_write` 写入完整计划；
-3. 单独调用 `ExitPlanMode`。
+1. 用 `read/grep/find/ls` 探索代码，并主动寻找可以复用的既有实现；
+2. 解决会影响实现方案的关键歧义；
+3. 用 `plan_write` 写入完整计划；
+4. 单独调用 `ExitPlanMode`。
+
+内部提示词采用五阶段工作流：Initial Understanding、Design、Review、Final Plan、Finish。这些阶段只约束模型行为，不会显示在 TUI 中。
+
+最终 Plan 采用明确的内容契约：
+
+```markdown
+## Context
+用一段简洁文字说明为什么要改、解决什么问题，以及预期结果。
+
+## Implementation Steps
+1. `path/to/file.ts`
+   - 说明具体修改；
+   - 指出要复用的既有函数、类型或 utility 及其来源路径；
+   - 必要时注明步骤顺序和依赖。
+
+## Verification
+- 列出仓库真实支持的验证命令；
+- 说明需要确认的端到端行为或回归场景。
+```
+
+Plan 只保留推荐方案，不堆叠备选方案、未决选项、探索笔记或占位文本；整体应便于快速浏览，同时详细到 execution agent 无需重新发现设计。
+
+TUI 的常驻 UI 只显示一个稳定的 `Plan Mode` 状态，用来告知当前处于只读规划约束中。它不会显示 planning/ready 等内部阶段、revision、Plan 路径或额外的 above-editor widget；批准计划并进入执行后，该状态会立即清除。`/plan status` 同样只报告 Plan Mode 是否 active。
 
 `ExitPlanMode` 会结束当前 planning run，把完整计划展示出来，并把以下命令放入空闲编辑框：
 
@@ -276,7 +300,7 @@ max
 /plan                         进入 Plan Mode，或显示当前状态
 /plan <task>                  进入 Plan Mode 并立即提交规划任务
 /plan on [task]               显式进入 Plan Mode
-/plan status                  查看状态
+/plan status                  查看 Plan Mode 是否 active
 /plan edit                    编辑 canonical plan
 /plan path                    显示 plan 文件路径
 /plan approve [action]        /plan-approve 的别名
@@ -313,7 +337,7 @@ pi --plan
 - execution handoff 使用审批时固化的完整正文，不会在执行时重新读取一个可能已变化的 draft；
 - session 恢复时只接受与 `<agentDir>/plans/<plan-id>.md` 精确匹配的 managed Plan 路径；
 - Plan 目录和文件拒绝符号链接替换，原子写入使用私有临时文件；
-- 初始模板必须被完整替换，且计划需要包含 `## Implementation Steps` 和编号步骤才能进入审批。
+- 新 Plan 必须完整替换初始模板，并包含非空的 `## Context`、带编号步骤的 `## Implementation Steps` 和非空的 `## Verification`；为恢复旧 session，早期的 `Objective`/`Validation` 标题仍可兼容读取。
 
 ## 开发
 
@@ -334,6 +358,8 @@ npm test
 - approved snapshot handoff；
 - `/plan-approve clear` 通过 stock Pi `newSession({ setup, withSession })` 创建 child session；
 - 模型主动调用 `EnterPlanMode` 后的 terminating continuation；
+- Claude 风格的五阶段内部规划提示与最终 Plan 内容契约；
+- planning/ready 只显示统一 `Plan Mode` 状态，execution 清除该状态且不创建常驻 widget；
 - session replacement 取消后的 ready-state 恢复；
 - keep-context execution 与 `/plan finish` baseline 恢复；
 - session tree 工具状态恢复；
